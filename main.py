@@ -5,12 +5,18 @@ import re
 import time
 import traceback
 import httpx
+
+import schemas
+
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from groq import AsyncGroq
 from dotenv import load_dotenv
+from db_connection import get_db
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -48,7 +54,8 @@ class ChatRequest(BaseModel):
     prompt: str
 
 class Credentials(BaseModel):
-    username: str = Field(pattern=r'^[a-zA-Z0-9_]{3,24}$')
+    name: str = Field(pattern=r'^[a-zA-Z0-9_]{3,24}$')
+    email: str = Field(pattern="^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*$")
     password: str = Field(min_length=8, max_length=128)
 
 
@@ -116,6 +123,22 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/teste-conexao")
+async def testar_conexao(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text("SELECT VERSION()"))
+    versao = result.scalar()
+
+    return {
+        "status": "Conectado ao MySQL com sucesso!",
+        "versao_mysql": versao
+    }
+
+@app.post("/register/system", respon)
+async def posta_usuario(user: Credentials, request: Request, db: AsyncSession = Depends(get_db)):
+    check_origin(request)
+    limit_auth(request.client.host if request.client else 'unknown')
+    result = await db.execute(select(Usuario).where(Usuario.email == usuario.email))
 
 
 @app.post('/register', status_code=201)

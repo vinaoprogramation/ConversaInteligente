@@ -1,4 +1,3 @@
-"""Mantém conexões de um único processo e uma única instância FastAPI."""
 import asyncio
 from dataclasses import dataclass, field
 from uuid import uuid4
