@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WebSocket com autenticação — FastAPI</title>
+  <style>
+    *{box-sizing:border-box}body{font:15px system-ui,Arial;background:#f2f4f8;margin:0;padding:24px}
+    main{background:#fff;border-radius:12px;max-width:850px;margin:auto;padding:24px;box-shadow:0 2px 12px #0001}
+    input,select,button{font:inherit;border:1px solid #bbb;border-radius:6px;padding:9px}
+    button{background:#16457b;color:white;border:none;cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}
+    .row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0}
+    .row input{flex:1;min-width:135px}.columns{display:grid;grid-template-columns:1fr 220px;gap:20px}
+    #messages{list-style:none;border:1px solid #ddd;border-radius:6px;height:280px;overflow:auto;padding:8px}
+    #messages li{border-bottom:1px solid #eee;padding:7px;overflow-wrap:anywhere}
+    #people{list-style:none;padding:0}#people li{padding:5px;border-bottom:1px solid #eee}
+    #status{color:#245991}#notice{color:#a12b2b;min-height:20px}
+    [hidden]{display:none!important}small{color:#666}h1{margin:0 0 10px}h2{font-size:18px}
+    @media(max-width:600px){.columns{grid-template-columns:1fr}main{padding:14px}}
+  </style>
+</head>
+<body><main>
+  <h1>Chat WebSocket seguro (laboratório)</h1>
+  <p id="notice" role="alert"></p>
+
+  <section id="auth">
+    <h2>Cadastro / Login</h2>
+    <form id="loginForm" class="row">
+      <input id="username" placeholder="Usuário (3–24 letras/números/_)" minlength="3" maxlength="24" required>
+      <input id="password" type="password" placeholder="Senha (mín. 8 caracteres)" minlength="8" maxlength="128" required>
+      <button id="loginButton" type="submit">Entrar</button>
+      <button id="registerButton" type="button">Cadastrar</button>
+    </form>
+    <small>Cadastre duas contas diferentes para testar as conversas.</small>
+  </section>
+
+  <section id="app" hidden>
+    <div class="row">
+      <strong id="who"></strong>
+      <button id="logoutButton">Sair da conta</button>
+    </div>
+    <div class="row">
+      <label for="rooms">Sala:</label><select id="rooms"></select>
+      <button id="refreshButton">Atualizar salas</button>
+      <input id="newRoom" placeholder="Nova sala (ex.: projeto)" maxlength="24">
+      <button id="createButton">Criar sala</button>
+    </div>
+    <div class="row">
+      <input id="inviteName" placeholder="Usuário para convidar">
+      <button id="inviteButton">Convidar para sala atual</button>
+    </div>
+    <p id="status">Desconectado</p>
+    <div class="columns">
+      <section>
+        <h2>Mensagens</h2>
+        <ul id="messages"></ul>
+        <form id="chatForm" class="row">
+          <select id="recipient"><option value="">Todos da sala</option></select>
+          <input id="messageText" placeholder="Sua mensagem" maxlength="500" required>
+          <button id="sendButton" type="submit" disabled>Enviar</button>
+        </form>
+      </section>
+      <aside>
+        <h2>Online (<span id="onlineCount">0</span>)</h2>
+        <ul id="people"></ul>
+      </aside>
+    </div>
+  </section>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const auth = $('auth'), app = $('app'), notice = $('notice');
+  const status = $('status'), rooms = $('rooms'), messages = $('messages');
+  const recipient = $('recipient'), people = $('people');
+  let socket = null, myConnectionId = null, shouldConnect = false;
+  let retryTimer = null, attempts = 0, loggedUser = null;
+
+  function alertText(text = '') { notice.textContent = text; }
+  function showMessage(text) {
+    const item = document.createElement('li');
+    item.textContent = text; // Nunca inserir mensagens de usuários usando innerHTML.
+    messages.appendChild(item);
+    messages.scrollTop = messages.scrollHeight;
+  }
+  function clearPeople() {
+    people.replaceChildren();
+    recipient.replaceChildren(new Option('Todos da sala', ''));
+    $('onlineCount').textContent = '0';
+  }
+  function showPeople(users) {
+    const chosen = recipient.value;
+    clearPeople();
+    $('onlineCount').textContent = String(users.length);
+    for (const user of users) {
+      const li = document.createElement('li');
+      li.textContent = user.name + (user.id === myConnectionId ? ' (você)' : '');
+      people.appendChild(li);
+      if (user.id !== myConnectionId) recipient.add(new Option(user.name, user.id));
+    }
+    if ([...recipient.options].some(option => option.value === chosen)) recipient.value = chosen;
+  }
+
+  async function api(path, method = 'GET', body) {
+    const response = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      headers: body ? {'Content-Type': 'application/json'} : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+
+  function disconnect() {
+    shouldConnect = false;
+    clearTimeout(retryTimer);
+    if (socket) socket.close(1000, 'Troca de sala ou logout');
+    socket = null;
+    myConnectionId = null;
+    $('sendButton').disabled = true;
+    clearPeople();
+  }
+
+  function scheduleRetry() {
+    const seconds = Math.min(2 ** attempts, 10);
+    attempts += 1;
+    status.textContent = `Conexão interrompida. Nova tentativa em ${seconds}s...`;
+    retryTimer = setTimeout(connectRoom, seconds * 1000);
+  }
+
+  async function loadRooms(preferred) {
+    const data = await api('/rooms');
+    const oldRoom = preferred || rooms.value;
+    rooms.replaceChildren();
+    for (const room of data.rooms) rooms.add(new Option(room, room));
+    rooms.value = data.rooms.includes(oldRoom) ? oldRoom : (data.rooms[0] || '');
+  }
+
+  async function connectRoom() {
+    if (!shouldConnect || !rooms.value) return;
+    const chosenRoom = rooms.value;
+    try {
+      await api('/me'); // Valida a sessão antes de iniciar/repetir conexão.
+    } catch (error) {
+      if (error.status === 401) {
+        disconnect();
+        loggedUser = null;
+        app.hidden = true;
+        auth.hidden = false;
+        alertText('Sessão expirada. Faça login novamente.');
+        return;
+      }
+      scheduleRetry();
+      return;
+    }
+    if (!shouldConnect || chosenRoom !== rooms.value) return;
+    const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${scheme}//${location.host}/ws?room=${encodeURIComponent(chosenRoom)}`);
+    socket = ws;
+    status.textContent = `Conectando à sala ${chosenRoom}...`;
+    ws.addEventListener('open', () => {
+      if (ws !== socket) return;
+      attempts = 0;
+      $('sendButton').disabled = false;
+      status.textContent = `Conectado à sala ${chosenRoom}`;
+    });
+    ws.addEventListener('message', event => {
+      if (ws !== socket) return;
+      let data;
+      try { data = JSON.parse(event.data); } catch { return; }
+      if (data.type === 'welcome') {
+        myConnectionId = data.id;
+        showMessage(`Você entrou na sala ${data.room}.`);
+      } else if (data.type === 'presence') {
+        showPeople(data.users);
+      } else if (data.type === 'chat') {
+        showMessage(`${data.fromName}: ${data.text}`);
+      } else if (data.type === 'private') {
+        showMessage(`[Privada] ${data.fromName} → ${data.toName}: ${data.text}`);
+      } else if (data.type === 'error') {
+        showMessage(`[Erro] ${data.message}`);
+      }
+    });
+    ws.addEventListener('close', () => {
+      if (ws !== socket) return;
+      socket = null;
+      $('sendButton').disabled = true;
+      myConnectionId = null;
+      clearPeople();
+      if (shouldConnect) scheduleRetry();
+    });
+    ws.addEventListener('error', () => {
+      if (ws === socket) status.textContent = 'Problema na conexão.';
+    });
+  }
+
+  async function signedIn() {
+    const user = await api('/me');
+    loggedUser = user.username;
+    $('who').textContent = `Conectado como ${loggedUser}`;
+    auth.hidden = true;
+    app.hidden = false;
+    await loadRooms('geral');
+    disconnect();
+    shouldConnect = true;
+    attempts = 0;
+    connectRoom();
+  }
+
+  $('registerButton').addEventListener('click', async () => {
+    try {
+      const username = $('username').value.trim();
+      const password = $('password').value;
+      await api('/register', 'POST', {username, password});
+      alertText('Cadastro concluído. Agora clique em Entrar.');
+    } catch (error) { alertText(error.message); }
+  });
+
+  $('loginForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      const username = $('username').value.trim();
+      const password = $('password').value;
+      await api('/login', 'POST', {username, password});
+      $('password').value = '';
+      alertText();
+      await signedIn();
+    } catch (error) { alertText(error.message); }
+  });
+
+  $('logoutButton').addEventListener('click', async () => {
+    disconnect();
+    try { await api('/logout', 'POST'); }
+    catch (error) { alertText(error.message); }
+    app.hidden = true;
+    auth.hidden = false;
+    status.textContent = 'Desconectado';
+  });
+
+  $('refreshButton').addEventListener('click', async () => {
+    try { await loadRooms(); } catch (error) { alertText(error.message); }
+  });
+
+  rooms.addEventListener('change', () => {
+    disconnect();
+    messages.replaceChildren();
+    shouldConnect = true;
+    attempts = 0;
+    connectRoom();
+  });
+
+  $('createButton').addEventListener('click', async () => {
+    try {
+      const name = $('newRoom').value.trim().toLowerCase();
+      await api('/rooms', 'POST', {name});
+      await loadRooms(name);
+      messages.replaceChildren();
+      disconnect();
+      shouldConnect = true;
+      connectRoom();
+      $('newRoom').value = '';
+      alertText(`Sala ${name} criada.`);
+    } catch (error) { alertText(error.message); }
+  });
+
+  $('inviteButton').addEventListener('click', async () => {
+    try {
+      const username = $('inviteName').value.trim();
+      await api(`/rooms/${encodeURIComponent(rooms.value)}/members`, 'POST', {username});
+      $('inviteName').value = '';
+      alertText(`Convite autorizado para ${username}. A pessoa deve atualizar suas salas.`);
+    } catch (error) { alertText(error.message); }
+  });
+
+  $('chatForm').addEventListener('submit', event => {
+    event.preventDefault();
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const text = $('messageText').value.trim();
+    if (!text) return;
+    socket.send(JSON.stringify(recipient.value
+      ? {type: 'private', to: recipient.value, text}
+      : {type: 'chat', text}));
+    $('messageText').value = '';
+  });
+
+  window.addEventListener('pagehide', disconnect);
+  signedIn().catch(() => { app.hidden = true; auth.hidden = false; });
+</script>
+</body>
+</html>
