@@ -97,20 +97,20 @@ def homepage():
     html = Path(__file__).with_name('index.html').read_text(encoding='utf-8')
     return HTMLResponse(html)
 
-history:{
-    
-}
-
+historico_contexto = []
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
+    historico_contexto.append({"role": "user", "content": request.prompt})
+
     try:
         completion = await groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",  # Verifique se o modelo é válido e ativo
-            messages=[
-                {"role": "user", "content": request.prompt}
-            ],
+            model="openai/gpt-oss-120b",
+            messages=historico_contexto,
             temperature=0.7
         )
+        
+        historico_contexto.append({"role": "assistant", "content": request.prompt})
+                
         return {"response": completion.choices[0].message.content}
 
     except Exception as e:
